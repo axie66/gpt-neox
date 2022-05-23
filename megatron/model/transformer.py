@@ -169,8 +169,8 @@ class ParallelLinear(nn.Module):
                 skip_bias_add=False,
             )
 
-    def forward(self, hidden_states):
-        return self.final_linear(hidden_states)
+    def forward(self, hidden_states, *args):
+        return (self.final_linear(hidden_states), *args)
 
 
 class ParallelSelfAttention(nn.Module):
@@ -530,6 +530,7 @@ class ParallelTransformerLayer(nn.Module):
         rpe=None,
         rotary=False,
         use_cache=False,
+        ret_ffn_inp=False,
     ):
 
         super().__init__()
@@ -544,6 +545,7 @@ class ParallelTransformerLayer(nn.Module):
         self.hidden_dropout = neox_args.hidden_dropout
         self.bias_dropout_fusion = neox_args.bias_dropout_fusion
         self.gpt_j_residual = neox_args.gpt_j_residual
+        self.ret_ffn_inp = ret_ffn_inp
 
         if self.gpt_j_residual:
             self.reduce = mpu.mappings.reduce_from_model_parallel_region
@@ -613,7 +615,11 @@ class ParallelTransformerLayer(nn.Module):
                 )
 
             # output = mlp(ln2(x)) + attention_output
-            mlp_output, mlp_bias = self.mlp(self.post_attention_layernorm(x))
+            attn_layernorm = self.post_attention_layernorm(x)
+
+            knn_query = attn_layernorm.clone() if self.ret_ffn_inp else None
+
+            mlp_output, mlp_bias = self.mlp(attn_layernorm)
             with torch.enable_grad():
                 output = bias_dropout_fn(
                     mlp_output,
@@ -647,8 +653,12 @@ class ParallelTransformerLayer(nn.Module):
                 )
 
             # output = x + mlp(ln2(x))
+            attn_layernorm = self.post_attention_layernorm(attention_output)
+
+            knn_query = attn_layernorm.clone() if self.ret_ffn_inp else None
+
             mlp_output, mlp_bias = self.mlp(
-                self.post_attention_layernorm(attention_output)
+                attn_layernorm
             )
             with torch.enable_grad():
                 output = bias_dropout_fn(
@@ -658,7 +668,7 @@ class ParallelTransformerLayer(nn.Module):
                     prob=self.hidden_dropout,
                 )
 
-        return output
+        return output, knn_query
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
@@ -666,23 +676,32 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
 
     def forward(self, args):
         assert (
-            len(args) == 2
-        ), "ParallelTransformerLayerPipe expects 2 arguments - hidden_states and attention_mask"
-        hidden_states, attention_mask = args
-        # we are returning just [hidden_states, mask]
-        return super().forward(hidden_states, attention_mask), attention_mask
+            len(args) == 3
+        ), "ParallelTransformerLayerPipe expects 3 arguments - hidden_states, attention_mask, kNN query"
+        hidden_states, attention_mask, knn_query = args
+        # we are returning [hidden_states, (optionally ffn_input)]
+        hidden_states, new_knn_query = super().forward(hidden_states, attention_mask)
+        if new_knn_query is not None:
+            return hidden_states, attention_mask, new_knn_query
+        return hidden_states, attention_mask, knn_query
 
 
 class ParallelLinearPipe(ParallelLinear):
     """Another helper class to pass presents through to the output when doing inference with a Pipe Parallel model"""
 
     def forward(self, args):
-        assert isinstance(
-            args, torch.Tensor
-        ), "ParallelLinearPipe expects a single argument - hidden_states"
-        hidden_state = args
+        assert (
+            isinstance(args, torch.Tensor) or 
+            (isinstance(args, tuple) and 
+             all(isinstance(_a, torch.Tensor) for _a in args))
+        ), "ParallelLinearPipe expects tensor(s) as input"
+        if isinstance(args, tuple):
+            hidden_state, *other_args = args
+        else:
+            hidden_state = args
+            other_args = ()
         logits, bias = super().forward(hidden_state)
-        return logits
+        return (logits, *other_args)
 
 
 class NormPipe(nn.Module):
@@ -693,10 +712,11 @@ class NormPipe(nn.Module):
         self.norm = norm_class(hidden_size, eps=eps)
 
     def forward(self, args):
-        assert not isinstance(
-            args, tuple
-        ), "NormPipe should only receive a single tensor as input"
-        return self.norm(args)
+        # assert not isinstance(
+        #     args, tuple
+        # ), "NormPipe should only receive a single tensor as input"
+        hidden_state, *other_args = args
+        return (self.norm(hidden_state), *other_args)
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output, bias=None):

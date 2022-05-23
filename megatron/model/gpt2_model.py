@@ -43,6 +43,8 @@ from megatron.model.word_embeddings import EmbeddingPipe, SoftEmbedding
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from typing import Union, List
 
+from knnlm import Datastore
+
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
     attention_scores.masked_fill_(ltor_mask, -10000.0)
@@ -78,10 +80,10 @@ def _pre_transformer_block(args):
 
 
 def _post_transformer_block(args):
-    # from (hidden_states, attention_mask)
-    # to (hidden_states.T)
-    assert len(args) == 2, "Incorrect number of arguments to _post_transformer_block"
-    fn = lambda _args: (_args[0].transpose(0, 1).contiguous())
+    # from (hidden_states, attention_mask, optionally ffn_input)
+    # to (hidden_states.T, optionally ffn_input)
+    assert len(args) == 3, "Incorrect number of arguments to _post_transformer_block"
+    fn = lambda _args: (_args[0].transpose(0, 1).contiguous(), _args[2].transpose(0, 1).contiguous())
     return fn(args)
 
 
@@ -105,6 +107,9 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
         parallel_output=True,
         topology=None,
         use_cache=False,
+        ret_ffn_inp=False,
+        use_knn=False,
+        datastore_config=None,
     ):
         self.neox_args = neox_args
 
@@ -116,6 +121,12 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
             self.neox_args
         )
         self.__topology__ = topology
+        self.ret_ffn_inp = ret_ffn_inp or use_knn
+        self.use_knn = use_knn
+        if use_knn:
+            self.dstore = Datastore(**datastore_config)
+        else:
+            self.dstore = None
 
         self.specs = []
         self.init_specs()  # initializes the layer specs (basically a fancy nn.Sequential)
@@ -162,6 +173,16 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
             partition_method=self.neox_args.pipe_partition_method,
             checkpointable_layers=["GMLPBlock", "ParallelTransformerLayerPipe"],
         )
+
+    def _knn_retrieval_block(self, args):
+        # from (logits, knn_query)
+        # to (logits)
+        assert isinstance(args, torch.Tensor) or \
+            (isinstance(args, tuple) and len(args) == 2), \
+            "Incorrect number of arguments to _knn_retrieval_block"
+
+        fn = lambda _args: self.dstore(*_args) if isinstance(_args, tuple) else _args[0]
+        return fn(args)
 
     def init_specs(self):
 
@@ -226,6 +247,8 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
         for i in range(self.neox_args.num_layers):
             layer_type = self.neox_args.attention_config[i]
             if layer_type in ["gmlp", "amlp"]:
+                if self.ret_ffn_inp:
+                    raise Exception("kNN not yet implemented for gmlp and amlp layers")
                 self.specs.append(
                     LayerSpec(
                         GMLPBlock,
@@ -248,6 +271,8 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                         rpe=rpe_emb if self.neox_args.pos_emb == "rpe" else None,
                         rotary=self.neox_args.pos_emb == "rotary",
                         use_cache=self.use_cache,
+                        ret_ffn_inp=(self.ret_ffn_inp and 
+                                     i == self.neox_args.num_layers - 1)
                     )
                 )
 
@@ -260,14 +285,15 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
             LayerSpec(NormPipe, norm, self.neox_args.hidden_size, eps=eps)
         )
 
-        # outputs are now a single tensor: hidden_states
+        # outputs are now (hidden_states, knn_query)
 
-        def _logits_helper(embedding, lm_output):
+        def _logits_helper(embedding, args):
+            lm_output, *other_args = args
             """Just a wrapper to massage inputs/outputs from pipeline."""
             logits = parallel_lm_logits(
                 lm_output, embedding.word_embeddings_weight, self.parallel_output
             )
-            return logits
+            return (logits, *other_args)
 
         if weight_tying:
             self.specs.append(
@@ -294,6 +320,9 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                     parallel_output=self.parallel_output,
                 )
             )
+
+        if self.use_knn:
+            self.specs.append(self._knn_retrieval_block)
 
     def _set_parallel_output(self, value):
         # sets the parallel output value of the final layer to value
